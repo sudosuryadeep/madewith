@@ -1,0 +1,12 @@
+{
+  "name": "famapp-telegram-alert",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "vercel dev", "start": "node local.js" },
+  "dependencies": {
+    "@upstash/redis": "^1.35.3",
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": { "vercel": "^39.2.0" }
+}
