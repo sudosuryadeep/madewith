@@ -1,114 +1,159 @@
+
 import { google } from "googleapis";
 import { Redis } from "@upstash/redis";
 
 const redis = Redis.fromEnv();
-const b64 = (s = "") => Buffer.from(s, "base64").toString("utf8");
-const decodePart = (part) => {
+
+function decode(data = "") {
+  return Buffer.from(
+    data.replace(/-/g, "+").replace(/_/g, "/"),
+    "base64"
+  ).toString("utf8");
+}
+
+function getBody(part) {
   if (!part) return "";
-  if (part.mimeType === "text/plain" && part.body?.data) return b64(part.body.data);
-  if (part.parts) return part.parts.map(decodePart).filter(Boolean).join("\n");
-  return "";
-};
-const header = (headers, name) =>
-  headers?.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
 
-function getGmail() {
-  const oauth = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI || "https://developers.google.com/oauthplayground"
-  );
-  oauth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-  return google.gmail({ version: "v1", auth: oauth });
-}
+  let text = "";
 
-async function sendTelegram(text) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) throw new Error("Missing Telegram configuration");
-  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    })
-  });
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error("Telegram send failed");
-}
+  if (part.body?.data) {
+    const decoded = decode(part.body.data);
 
-function escapeHtml(s = "") {
-  return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+    if (part.mimeType === "text/plain") {
+      text += decoded + "\n";
+    } else if (part.mimeType === "text/html") {
+      text += decoded.replace(/<[^>]*>/g, " ") + "\n";
+    }
+  }
+
+  for (const child of part.parts || []) {
+    text += getBody(child);
+  }
+
+  return text;
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "GET" && req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  if (req.method !== "GET") {
+    return res.status(405).json({ error: "Method not allowed" });
   }
+
   const secret = process.env.CRON_SECRET;
-  const auth = req.headers.authorization || "";
-  const supplied = req.query?.key || "";
-  if (secret && auth !== `Bearer ${secret}` && supplied !== secret) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  if (
+    secret &&
+    req.headers.authorization !== `Bearer ${secret}`
+  ) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
 
   try {
-    const gmail = getGmail();
-    // Narrow the search to FamApp/FamPay payment-received emails.
-    const query = process.env.GMAIL_SEARCH_QUERY ||
-      'newer_than:2d (from:famapp.in OR from:famapp.com) (subject:received OR subject:payment OR "successfully received")';
-    const list = await gmail.users.messages.list({
-      userId: "me", q: query, maxResults: 25
+    const oauth = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI ||
+        "https://developers.google.com/oauthplayground"
+    );
+
+    oauth.setCredentials({
+      refresh_token: process.env.GOOGLE_REFRESH_TOKEN
     });
-    const messages = list.data.messages || [];
-    let sent = 0, skipped = 0;
 
-    for (const item of messages.reverse()) {
-      const key = `famapp-alert:${item.id}`;
-      if (await redis.get(key)) { skipped++; continue; }
+    const gmail = google.gmail({ version: "v1", auth: oauth });
 
-      const full = await gmail.users.messages.get({
-        userId: "me", id: item.id, format: "full"
-      });
-      const payload = full.data.payload || {};
-      const headers = payload.headers || [];
-      const from = header(headers, "From");
-      const subject = header(headers, "Subject") || "FamApp payment email";
-      const date = header(headers, "Date") || "";
-      const body = decodePart(payload);
-      const text = `${subject}\n${body}`.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+    const result = await gmail.users.messages.list({
+      userId: "me",
+      q: process.env.GMAIL_SEARCH_QUERY ||
+        'newer_than:2d {from:famapp.in from:fampay.in from:famapp.com}',
+      maxResults: 50
+    });
 
-      // Only forward likely payment-received notifications, not arbitrary email.
-      if (!/famapp|fam\.?pay/i.test(from) ||
-          !/successfully received|received.*₹|payment received|you have successfully received/i.test(text)) {
-        await redis.set(key, "ignored", { ex: 60 * 60 * 24 * 14 });
+    let sent = 0;
+    let skipped = 0;
+
+    for (const msg of (result.data.messages || []).reverse()) {
+      const key = `payment-alert:${msg.id}`;
+
+      if (await redis.get(key)) {
         skipped++;
         continue;
       }
 
-      const amount = text.match(/₹\s?[\d,]+(?:\.\d{1,2})?/i)?.[0] || "Amount not detected";
-      const senderMatch = text.match(/\bfrom\s+([A-Z][A-Za-z .'-]{1,60}?)(?=\s+(?:Transaction ID|Date|Updated Balance)|[.,]|$)/i);
-      const sender = senderMatch?.[1]?.trim() || "Not detected";
-      const txMatch = text.match(/Transaction ID\s*:\s*([A-Z0-9-]+)/i);
-      const txn = txMatch?.[1] || "Not detected";
-      const safeMessage =
-        `💸 <b>FamApp Payment Received</b>\n\n` +
-        `💰 <b>Amount:</b> ${escapeHtml(amount)}\n` +
-        `👤 <b>From:</b> ${escapeHtml(sender)}\n` +
-        `🧾 <b>Transaction ID:</b> <code>${escapeHtml(txn)}</code>\n` +
-        `🕒 <b>Email date:</b> ${escapeHtml(date)}\n` +
-        `✉️ <b>Subject:</b> ${escapeHtml(subject)}\n\n` +
-        `<i>Alert generated from your Gmail notification.</i>`;
-      await sendTelegram(safeMessage);
-      await redis.set(key, "sent", { ex: 60 * 60 * 24 * 14 });
+      const result = await gmail.users.messages.get({
+        userId: "me",
+        id: msg.id,
+        format: "full"
+      });
+
+      const payload = result.data.payload || {};
+      const headers = payload.headers || [];
+
+      const getHeader = name =>
+        headers.find(
+          h => h.name?.toLowerCase() === name.toLowerCase()
+        )?.value || "";
+
+      const subject = getHeader("Subject") || "Payment notification";
+      const body = getBody(payload);
+      const content = `${subject}\n${body}`;
+
+      const payment =
+        /\b(payment|paid|sent|received|credited|debited|transaction|transfer)\b|₹/i
+          .test(content);
+
+      const failed =
+        /\b(payment failed|transaction failed|payment declined|transaction declined)\b/i
+          .test(content);
+
+      if (!payment || failed) {
+        await redis.set(key, "ignored", { ex: 1209600 });
+        skipped++;
+        continue;
+      }
+
+      const token = process.env.TELEGRAM_BOT_TOKEN;
+      const chatId = process.env.TELEGRAM_CHAT_ID;
+
+      if (!token || !chatId) {
+        throw new Error("Telegram configuration missing");
+      }
+
+      const response = await fetch(
+        `https://api.telegram.org/bot${token}/sendMessage`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text:
+              `💸 FamPay Payment Alert\n\n` +
+              `📩 ${subject}\n\n` +
+              body.replace(/\s+/g, " ").slice(0, 2500),
+            disable_web_page_preview: true
+          })
+        }
+      );
+
+      const telegram = await response.json();
+
+      if (!response.ok || !telegram.ok) {
+        throw new Error("Telegram message delivery failed");
+      }
+
+      await redis.set(key, "sent", { ex: 1209600 });
       sent++;
     }
-    return res.status(200).json({ ok: true, found: messages.length, sent, skipped });
-  } catch (err) {
-    console.error("Payment alert error:", err?.message || err);
-    return res.status(500).json({ ok: false, error: "Check server logs and environment variables." });
+
+    return res.status(200).json({
+      ok: true,
+      sent,
+      skipped
+    });
+  } catch (error) {
+    console.error("Payment alert error:", error.message);
+    return res.status(500).json({
+      ok: false,
+      error: "Check Vercel function logs"
+    });
   }
 }
